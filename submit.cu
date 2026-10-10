@@ -31,7 +31,7 @@ __global__ void lightKernel(int *d_offsets, int *d_neighs, int*d_weights, int *d
     int near_size,int * d_tent, int *d_near_next, int *d_processed, int *d_far,
     int *d_counters, int *d_far_flag, int *d_near_flag, int *d_proc_flag,
     int active_delta, int cutoff, int pass, int round ) {
-        int id = blockIdx.x * blockDim.x + threadIdx.x;
+    int id = blockIdx.x * blockDim.x + threadIdx.x;
     if(id < near_size) {
        
         int u = d_near[id];
@@ -86,6 +86,20 @@ __global__ void heavyKernel(int *d_offsets, int *d_neighs, int *d_weights, int *
         }
     }
 
+__global__ void pruneKernel(int *d_far, int far_size, int *d_tent, int *d_far_tmp,
+                            int *d_far_keys, int *d_counters, int last_cutoff) {
+    
+    int id = blockIdx.x * blockDim.x + threadIdx.x;
+    if(id < far_size) {
+        int v = d_far[id], k = d_tent[v];
+        if(k > last_cutoff) {
+            int slot = atomicAdd(&d_counters[3], 1);
+            d_far_tmp[slot] = v;
+            d_far_keys[slot] = k;
+        }
+    }             
+}
+
 
 
 // ============================================================================
@@ -134,6 +148,17 @@ void run_delta_stepping_single_source(
     }
     cudaMemcpy(&far_size, d_counters + 2, sizeof(int), cudaMemcpyDeviceToHost);
 
+    int last_cutoff = cutoff;
+    cudaMemset(d_counters + 3, 0, sizeof(int));
+    if(far_size > 0) {
+        int PKBLOCKS = (far_size + BLOCK_SIZE-1)/ BLOCK_SIZE;
+        pruneKernel<<<PKBLOCKS, BLOCK_SIZE>>> (d_far, far_size, d_tent, d_far_tmp, d_far_keys,
+                                               d_counters,last_cutoff);
+    }
+    cudaMemcpy(&far_size, d_counters + 3, sizeof(int), cudaMemcpyDeviceToHost);
+    swap(d_far, d_far_tmp);
+    cudaMemcpy(d_counters+2, &far_size, sizeof(int), cudaMemcpyHostToDevice);
+    
 }
 
 // ============================================================================
