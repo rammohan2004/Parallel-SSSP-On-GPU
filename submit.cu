@@ -8,6 +8,7 @@
 #include <thrust/unique.h>
 #include <thrust/binary_search.h>
 #include <thrust/copy.h>
+using namespace std;
 
 #define INF 2147483647 // simply INT_MAX
 #define BLOCK_SIZE 256 // you can change it.
@@ -16,25 +17,44 @@
 // CUDA KERNELS
 // ============================================================================
 
+__global__ void init(int *d_tent, int*d_far_flag, int *d_near_flag, int *d_proc_flag, int N) {
+    int id = blockIdx.x * blockDim.x + threadIdx.x;
+    if(id < N) {
+        d_tent[id] = INF;
+        d_far_flag[id] = 0;
+        d_near_flag[id] = -1;
+        d_proc_flag[id] = -1; 
+    }
+}
+
+
 
 // ============================================================================
 // SINGLE SOURCE DELTA-STEPPING DRIVER
 // ============================================================================
 
 void run_delta_stepping_single_source(
-    /*
-
-
-
-
-    */
+    /**/
+    int delta_mode, int K, int N, int E, int src,
+    int *d_offsets, int *d_neighs, int *d_weights,
+    int * d_tent, int *d_near, int *d_near_next, int *d_processed,
+    int *d_far, int *d_counters, int *d_far_keys, int *d_far_tmp,
+    int *d_far_flag, int *d_near_flag, int *d_proc_flag, vector<int>&deltas
 )
 {
-    /*
+    /**/
+    int NBLOCKS = (N + BLOCK_SIZE - 1) / (BLOCK_SIZE);
+    init<<<NBLOCKS, BLOCK_SIZE>>>(d_tent, d_far_flag, d_near_flag, d_proc_flag, N);
+    int zero = 0;
+    cudaMemcpy(d_tent+src, &zero, sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_near, &src, sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemset(d_counters, 0, 4 * sizeof(int));
+    int near_size = 1;
+    int far_size  = 0;
+    int active_delta = 0, cutoff = 0, pass = 0, round = 0;
+    int adaptive = (delta_mode == -1);
 
 
-
-    */
 }
 
 // ============================================================================
@@ -103,41 +123,47 @@ int main(int argc, char **argv)
     cudaMemcpy(d_weights, weights, E * sizeof(int), cudaMemcpyHostToDevice);
 
     int *h_tent = new int[ N ] { 0 }; // sssp distance arry. tent means tentative distance
+    int *d_tent;
     cudaMalloc(&d_tent, N * sizeof(int));
 
 
     /*
     ToDo
-
-
-
-
-
-
-
-
     */
+    int  *d_near, *d_near_next, *d_processed, *d_far, *d_counters;
+    int *d_far_keys, *d_far_tmp, *d_far_flag, *d_near_flag, *d_proc_flag;
+    cudaMalloc(&d_near, N * sizeof(int));
+    cudaMalloc(&d_near_next, N * sizeof(int));
+    cudaMalloc(&d_processed, N * sizeof(int));
+    cudaMalloc(&d_far, N * sizeof(int));
+    cudaMalloc(&d_far_keys, N * sizeof(int));
+    cudaMalloc(&d_far_tmp, N * sizeof(int));
+    cudaMalloc(&d_far_flag, N * sizeof(int));
+    cudaMalloc(&d_near_flag, N * sizeof(int));
+    cudaMalloc(&d_proc_flag, N * sizeof(int));
+    cudaMalloc(&d_counters, 4 * sizeof(int));
+    vector<int>deltas;
 
     for (int i = 0; i < S_count; ++i)
     {
         int source = sources[i];
-
+        deltas.clear();
         outfile << source << "\n";
 
         run_delta_stepping_single_source(
             /*
-            ToDo
-
-
-
-
-
-
-            */
+            ToDo*/
+            delta_mode, K, N, E, source,
+            d_offsets, d_neighs, d_weights,
+            d_tent, d_near, d_near_next, d_processed,
+            d_far, d_counters, d_far_keys, d_far_tmp,
+            d_far_flag, d_near_flag, d_proc_flag, deltas
         );
 
         cudaMemcpy(h_tent, d_tent, N * sizeof(int), cudaMemcpyDeviceToHost);
-
+        for(int j = 0; j < deltas.size(); j++) {
+            outfile << deltas[j] << "\n";
+        }
         for (int v = 0; v < N; ++v)
         {
             outfile << h_tent[v] << "\n";
@@ -147,6 +173,21 @@ int main(int argc, char **argv)
     delete[] offsets;
     delete[] neighs;
     delete[] weights;
+    delete[] h_tent;
+    cudaFree(d_near);
+    cudaFree(d_near_next);
+    cudaFree(d_far);
+    cudaFree(d_counters);
+    cudaFree(d_processed);
+    cudaFree(d_far_keys);
+    cudaFree(d_far_tmp);
+    cudaFree(d_far_flag);
+    cudaFree(d_near_flag);
+    cudaFree(d_proc_flag);
+    cudaFree(d_tent);
+    cudaFree(d_offsets);
+    cudaFree(d_neighs);
+    cudaFree(d_weights);
 
     outfile.close();
     return 0;
