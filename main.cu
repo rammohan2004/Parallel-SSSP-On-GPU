@@ -64,7 +64,27 @@ __global__ void lightKernel(int *d_offsets, int *d_neighs, int*d_weights, int *d
     }
 }
 
+__global__ void heavyKernel(int *d_offsets, int *d_neighs, int *d_weights, int *d_processed,
+    int proc_size, int *d_tent, int *d_far, int *d_counters, int * d_far_flag, int active_delta) {
+        int id = blockIdx.x * blockDim.x + threadIdx.x;
+        if(id < proc_size) {
+           int u = d_processed[id], du = d_tent[u];
+           for(int e = d_offsets[u] ; e < d_offsets[u+1]; e++) {
+                int w = d_weights[e];
+                if(w <= active_delta) continue;
+                int v = d_neighs[e];
+                int nd = du + w;
+                int old = atomicMin(&d_tent[v], nd);
+                if(nd < old) {
+                    if(atomicCAS(&d_far_flag[v], 0, 1) == 0) {
+                        int slot = atomicAdd(&d_counters[2], 1);
+                        d_far[slot] = v;
+                    }
+                }
+            }
 
+        }
+    }
 
 
 
@@ -89,8 +109,8 @@ void run_delta_stepping_single_source(
     cudaMemcpy(d_near, &src, sizeof(int), cudaMemcpyHostToDevice);
     cudaMemset(d_counters, 0, 4 * sizeof(int));
     int near_size = 1;
-    int far_size  = 0;
-    int active_delta = 1000, cutoff = INF, pass = 0, round = 1;
+    int far_size  = 0, proc_size = 0;
+    int active_delta = 0, cutoff = 0, pass = 0, round = 1;
     int adaptive = (delta_mode == -1);
 
     
@@ -105,6 +125,14 @@ void run_delta_stepping_single_source(
         cudaMemcpy(&near_size, d_counters, sizeof(int), cudaMemcpyDeviceToHost);
         swap(d_near, d_near_next);
     }
+
+    cudaMemcpy(&proc_size, d_counters + 1, sizeof(int), cudaMemcpyDeviceToHost);
+    if(proc_size > 0) {
+        int HKBLOCKS = (proc_size + BLOCK_SIZE-1)/ BLOCK_SIZE;
+        heavyKernel<<<HKBLOCKS, BLOCK_SIZE>>> (d_offsets, d_neighs, d_weights, d_processed, proc_size,
+                                               d_tent, d_far, d_counters, d_far_flag, active_delta);
+    }
+    cudaMemcpy(&far_size, d_counters + 2, sizeof(int), cudaMemcpyDeviceToHost);
 
 }
 
