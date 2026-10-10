@@ -27,6 +27,45 @@ __global__ void init(int *d_tent, int*d_far_flag, int *d_near_flag, int *d_proc_
     }
 }
 
+__global__ void lightKernel(int *d_offsets, int *d_neighs, int*d_weights, int *d_near,
+    int near_size,int * d_tent, int *d_near_next, int *d_processed, int *d_far,
+    int *d_counters, int *d_far_flag, int *d_near_flag, int *d_proc_flag,
+    int active_delta, int cutoff, int pass, int round ) {
+        int id = blockIdx.x * blockDim.x + threadIdx.x;
+    if(id < near_size) {
+       
+        int u = d_near[id];
+        if(d_proc_flag[u] != round) {
+            d_proc_flag[u] = round;
+            int slot = atomicAdd(&d_counters[1], 1);
+            d_processed[slot] = u;
+        }
+        int du = d_tent[u];
+        for(int e = d_offsets[u] ; e < d_offsets[u+1]; e++) {
+            int w = d_weights[e];
+            if(w > active_delta) continue;
+            int v = d_neighs[e];
+            int nd = du + w;
+            int old = atomicMin(&d_tent[v], nd);
+            if(nd < old) {
+                if(nd <= cutoff) {
+                    if(atomicExch(&d_near_flag[v], pass) != pass) {
+                        int slot = atomicAdd(&d_counters[0], 1);
+                        d_near_next[slot] = v;
+                    }
+                } else {
+                    if(atomicCAS(&d_far_flag[v], 0, 1) == 0) {
+                        int slot = atomicAdd(&d_counters[2], 1);
+                        d_far[slot] = v;
+                    }
+                }
+            }
+        }
+    }
+}
+
+
+
 
 
 // ============================================================================
@@ -51,9 +90,21 @@ void run_delta_stepping_single_source(
     cudaMemset(d_counters, 0, 4 * sizeof(int));
     int near_size = 1;
     int far_size  = 0;
-    int active_delta = 0, cutoff = 0, pass = 0, round = 0;
+    int active_delta = 1000, cutoff = INF, pass = 0, round = 1;
     int adaptive = (delta_mode == -1);
 
+    
+    while(near_size > 0) {
+        pass++;
+        cudaMemset(d_counters , 0, sizeof(int));
+        int LKBLOCKS = (near_size + BLOCK_SIZE-1)/ BLOCK_SIZE;
+        lightKernel<<<LKBLOCKS, BLOCK_SIZE>>> (d_offsets, d_neighs, d_weights, d_near, near_size,
+                                               d_tent, d_near_next, d_processed, d_far, d_counters, 
+                                               d_far_flag, d_near_flag, d_proc_flag, active_delta,
+                                               cutoff, pass, round);
+        cudaMemcpy(&near_size, d_counters, sizeof(int), cudaMemcpyDeviceToHost);
+        swap(d_near, d_near_next);
+    }
 
 }
 
