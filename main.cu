@@ -91,7 +91,7 @@ __global__ void pruneKernel(int *d_far, int far_size, int *d_tent, int *d_far_tm
     
     int id = blockIdx.x * blockDim.x + threadIdx.x;
     if(id < far_size) {
-        int v = d_far[index], k = d_tent[v];
+        int v = d_far[id], k = d_tent[v];
         if(k > last_cutoff) {
             int slot = atomicAdd(&d_counters[3], 1);
             d_far_tmp[slot] = v;
@@ -118,48 +118,90 @@ void run_delta_stepping_single_source(
     /**/
     int NBLOCKS = (N + BLOCK_SIZE - 1) / (BLOCK_SIZE);
     init<<<NBLOCKS, BLOCK_SIZE>>>(d_tent, d_far_flag, d_near_flag, d_proc_flag, N);
+    int near_size = 1;
     int zero = 0;
     cudaMemcpy(d_tent+src, &zero, sizeof(int), cudaMemcpyHostToDevice);
     cudaMemcpy(d_near, &src, sizeof(int), cudaMemcpyHostToDevice);
     cudaMemset(d_counters, 0, 4 * sizeof(int));
-    int near_size = 1;
+    
     int far_size  = 0, proc_size = 0;
-    int active_delta = 0, cutoff = 0, pass = 0, round = 1;
+    int active_delta = 0, cutoff = 0, pass = 0, round = 0;
     int adaptive = (delta_mode == -1);
 
-    
-    while(near_size > 0) {
-        pass++;
-        cudaMemset(d_counters , 0, sizeof(int));
-        int LKBLOCKS = (near_size + BLOCK_SIZE-1)/ BLOCK_SIZE;
-        lightKernel<<<LKBLOCKS, BLOCK_SIZE>>> (d_offsets, d_neighs, d_weights, d_near, near_size,
-                                               d_tent, d_near_next, d_processed, d_far, d_counters, 
-                                               d_far_flag, d_near_flag, d_proc_flag, active_delta,
-                                               cutoff, pass, round);
-        cudaMemcpy(&near_size, d_counters, sizeof(int), cudaMemcpyDeviceToHost);
-        swap(d_near, d_near_next);
+    while(true) {
+
+        round++;
+        cudaMemset(d_counters+1, 0, sizeof(int));
+
+        while(near_size > 0) {
+            pass++;
+            cudaMemset(d_counters , 0, sizeof(int));
+            int LKBLOCKS = (near_size + BLOCK_SIZE-1)/ BLOCK_SIZE;
+            lightKernel<<<LKBLOCKS, BLOCK_SIZE>>> (d_offsets, d_neighs, d_weights, d_near, near_size,
+                                                d_tent, d_near_next, d_processed, d_far, d_counters, 
+                                                d_far_flag, d_near_flag, d_proc_flag, active_delta,
+                                                cutoff, pass, round);
+            cudaMemcpy(&near_size, d_counters, sizeof(int), cudaMemcpyDeviceToHost);
+            swap(d_near, d_near_next);
+        }
+
+        cudaMemcpy(&proc_size, d_counters + 1, sizeof(int), cudaMemcpyDeviceToHost);
+        if(proc_size > 0) {
+            int HKBLOCKS = (proc_size + BLOCK_SIZE-1)/ BLOCK_SIZE;
+            heavyKernel<<<HKBLOCKS, BLOCK_SIZE>>> (d_offsets, d_neighs, d_weights, d_processed, proc_size,
+                                                d_tent, d_far, d_counters, d_far_flag, active_delta);
+        }
+        cudaMemcpy(&far_size, d_counters + 2, sizeof(int), cudaMemcpyDeviceToHost);
+
+        int last_cutoff = cutoff;
+        cudaMemset(d_counters + 3, 0, sizeof(int));
+        if(far_size > 0) {
+            int PKBLOCKS = (far_size + BLOCK_SIZE-1)/ BLOCK_SIZE;
+            pruneKernel<<<PKBLOCKS, BLOCK_SIZE>>> (d_far, far_size, d_tent, d_far_tmp, d_far_keys,
+                                                d_counters,last_cutoff);
+        }
+        cudaMemcpy(&far_size, d_counters + 3, sizeof(int), cudaMemcpyDeviceToHost);
+        swap(d_far, d_far_tmp);
+        cudaMemcpy(d_counters+2, &far_size, sizeof(int), cudaMemcpyHostToDevice);
+
+        if(far_size == 0) break;
+
+        thrust::device_ptr<int> d_far_thrust(d_far);
+        thrust::device_ptr<int> d_far_keys_thrust(d_far_keys);
+        thrust::sort_by_key(d_far_keys_thrust, d_far_keys_thrust +far_size, d_far_thrust);
+
+        int Dmin, Dcutoff;
+        cudaMemcpy(&Dmin, d_far_keys, sizeof(int), cudaMemcpyDeviceToHost);
+        if(adaptive == 0) {
+            Dcutoff = min((long long)Dmin + delta_mode, (long long)INF);
+            active_delta = delta_mode;
+            if(active_delta == 0) {
+                active_delta = 1;
+            }
+        } else {
+            int i = min(K-1, far_size-1);
+            cudaMemcpy(&Dcutoff, d_far_keys + i, sizeof(int), cudaMemcpyDeviceToHost);
+            int D = Dcutoff-Dmin;
+            deltas.push_back(D);
+            active_delta = D;
+            if(active_delta == 0) {
+                active_delta = 1;
+            }
+        }
+
+        int cnt = thrust::upper_bound(d_far_keys_thrust,d_far_keys_thrust + far_size, Dcutoff) - d_far_keys_thrust;
+        cudaMemcpy(d_near, d_far, cnt*sizeof(int), cudaMemcpyDeviceToDevice);
+        int remaining = far_size- cnt;
+        if (remaining > 0)
+            cudaMemcpy(d_far_tmp,d_far + cnt, remaining*sizeof(int), cudaMemcpyDeviceToDevice);
+        swap(d_far, d_far_tmp);
+
+        near_size = cnt;
+        far_size  = remaining;
+        cudaMemcpy(d_counters+2, &far_size, sizeof(int), cudaMemcpyHostToDevice);
+        cutoff = Dcutoff;
     }
 
-    cudaMemcpy(&proc_size, d_counters + 1, sizeof(int), cudaMemcpyDeviceToHost);
-    if(proc_size > 0) {
-        int HKBLOCKS = (proc_size + BLOCK_SIZE-1)/ BLOCK_SIZE;
-        heavyKernel<<<HKBLOCKS, BLOCK_SIZE>>> (d_offsets, d_neighs, d_weights, d_processed, proc_size,
-                                               d_tent, d_far, d_counters, d_far_flag, active_delta);
-    }
-    cudaMemcpy(&far_size, d_counters + 2, sizeof(int), cudaMemcpyDeviceToHost);
-
-    int last_cutoff = cutoff;
-    cudaMemset(d_counters + 3, 0, sizeof(int));
-    if(far_size > 0) {
-        int PKBLOCKS = (far_size + BLOCK_SIZE-1)/ BLOCK_SIZE;
-        pruneKernel<<<PKBLOCKS, BLOCK_SIZE>>> (d_far, far_size, d_tent, d_far_tmp, d_far_keys,
-                                               d_counters,last_cutoff);
-    }
-    cudaMemcpy(&far_size, d_counters + 3, sizeof(int), cudaMemcpyDeviceToHost);
-    swap(d_far, d_far_tmp);
-    cudaMemcpy(d_counters+2, &far_size, sizeof(int), cudaMemcpyHostToDevice);
-
-    
 }
 
 // ============================================================================
